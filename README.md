@@ -281,12 +281,6 @@ cd frontend && npm run dev
 
 ---
 
-## 📞 Contact & Support
-
-**FlytBase Assignment Submission**
-- **Author**: AI-Enhanced Drone Operations Platform
-- **Date**: 2024
-- **Version**: 1.0.0 (Production Ready)
 
 **Key Features Demonstrated**:
 ✅ AI-Powered Mission Optimization  
