@@ -1,0 +1,355 @@
+# ===================================================================
+# Docker Compose Configuration for Drone Survey Management System
+# Production-ready orchestration with all required services
+# ===================================================================
+
+version: '3.8'
+
+services:
+  # ===================================================================
+  # Database Services
+  # ===================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: drone-survey-postgres
+    environment:
+      POSTGRES_DB: drone_survey_prod
+      POSTGRES_USER: drone_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_password_change_me}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - drone-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drone_user -d drone_survey_prod"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  # ===================================================================
+  # Cache and Message Broker
+  # ===================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: drone-survey-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-secure_redis_password}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - drone-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  # ===================================================================
+  # Main Application
+  # ===================================================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: drone-survey-app
+    environment:
+      # Database Configuration
+      DATABASE_URL: postgresql://drone_user:${DB_PASSWORD:-secure_password_change_me}@postgres:5432/drone_survey_prod
+      
+      # Redis Configuration
+      REDIS_URL: redis://:${REDIS_PASSWORD:-secure_redis_password}@redis:6379/0
+      
+      # Application Configuration
+      FLASK_ENV: production
+      SECRET_KEY: ${SECRET_KEY:-change-this-secret-key-in-production}
+      DEBUG: false
+      
+      # Security Configuration
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-jwt-secret-in-production}
+      CSRF_ENABLED: true
+      
+      # External Services
+      WEATHER_API_KEY: ${WEATHER_API_KEY}
+      MAPBOX_ACCESS_TOKEN: ${MAPBOX_ACCESS_TOKEN}
+      AI_MODEL_ENDPOINT: ${AI_MODEL_ENDPOINT}
+      
+      # Feature Flags
+      REAL_TIME_UPDATES_ENABLED: true
+      AI_OPTIMIZATION_ENABLED: true
+      3D_VISUALIZATION_ENABLED: true
+      
+      # Monitoring
+      APM_ENABLED: ${APM_ENABLED:-false}
+      APM_SERVER_URL: ${APM_SERVER_URL}
+      
+    volumes:
+      - app_logs:/app/logs
+      - app_uploads:/app/uploads
+      - app_models:/app/models
+    ports:
+      - "5000:5000"
+    networks:
+      - drone-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  # ===================================================================
+  # Background Task Worker
+  # ===================================================================
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: drone-survey-worker
+    command: celery -A backend.app.celery worker --loglevel=info --concurrency=4
+    environment:
+      DATABASE_URL: postgresql://drone_user:${DB_PASSWORD:-secure_password_change_me}@postgres:5432/drone_survey_prod
+      REDIS_URL: redis://:${REDIS_PASSWORD:-secure_redis_password}@redis:6379/0
+      FLASK_ENV: production
+      SECRET_KEY: ${SECRET_KEY:-change-this-secret-key-in-production}
+    volumes:
+      - app_logs:/app/logs
+      - app_models:/app/models
+    networks:
+      - drone-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+  # ===================================================================
+  # Task Monitor
+  # ===================================================================
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: drone-survey-flower
+    command: celery -A backend.app.celery flower --port=5555
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD:-secure_redis_password}@redis:6379/0
+      FLOWER_BASIC_AUTH: ${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+    ports:
+      - "5555:5555"
+    networks:
+      - drone-network
+    depends_on:
+      - redis
+      - worker
+    restart: unless-stopped
+
+  # ===================================================================
+  # Reverse Proxy and Load Balancer
+  # ===================================================================
+  nginx:
+    image: nginx:alpine
+    container_name: drone-survey-nginx
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./config/ssl:/etc/nginx/ssl:ro
+      - app_logs:/var/log/nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - drone-network
+    depends_on:
+      - app
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+        reservations:
+          memory: 64M
+
+  # ===================================================================
+  # Monitoring and Observability
+  # ===================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: drone-survey-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - drone-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: drone-survey-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "3000:3000"
+    networks:
+      - drone-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ===================================================================
+  # Log Management
+  # ===================================================================
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    container_name: drone-survey-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - drone-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.8.0
+    container_name: drone-survey-kibana
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    networks:
+      - drone-network
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+
+  # ===================================================================
+  # Backup Service
+  # ===================================================================
+  backup:
+    image: postgres:15-alpine
+    container_name: drone-survey-backup
+    environment:
+      PGUSER: drone_user
+      PGPASSWORD: ${DB_PASSWORD:-secure_password_change_me}
+      PGHOST: postgres
+      PGDATABASE: drone_survey_prod
+    volumes:
+      - backup_data:/backups
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh:ro
+    command: |
+      sh -c "
+        while true; do
+          echo 'Starting database backup...'
+          /usr/local/bin/backup.sh
+          echo 'Backup completed. Sleeping for 24 hours...'
+          sleep 86400
+        done
+      "
+    networks:
+      - drone-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+# ===================================================================
+# Network Configuration
+# ===================================================================
+networks:
+  drone-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ===================================================================
+# Volume Configuration
+# ===================================================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  app_logs:
+    driver: local
+  app_uploads:
+    driver: local
+  app_models:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  backup_data:
+    driver: local
